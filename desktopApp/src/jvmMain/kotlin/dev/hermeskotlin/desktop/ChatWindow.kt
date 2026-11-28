@@ -122,14 +122,17 @@ fun ChatWindow(
                 if (raiseGuard?.invoke() != false) LinuxWindowActivation.request(window)
             }
         }
-        val host = remember { ChatHost(koin.get(), koin.get(), koin.get(), koin.get(), koin.get(), koin.get(), koin.get()) }
+        val host = remember { ChatHost(koin.get(), koin.get(), koin.get(), koin.get(), koin.get(), koin.get(), active = koin.get()) }
         val focused = remember { MutableStateFlow(false) }
         val windowFocused = LocalWindowInfo.current.isWindowFocused
         LaunchedEffect(windowFocused) { focused.value = windowFocused }
         LaunchedEffect(host) { DesktopNotifier(host, koin.get(), focused, onPost, onNoticeChange).start(this) }
         val mainHost = koinInject<ChatHost>()
-        DisposableEffect(owner) {
+        val screenTool = koinInject<DesktopScreenTool>()
+        DisposableEffect(owner, host) {
+            screenTool.open(host)
             onDispose {
+                screenTool.close(host)
                 host.close()
                 owner.viewModelStore.clear()
             }

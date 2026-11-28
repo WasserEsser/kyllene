@@ -18,6 +18,7 @@ import dev.hermeskotlin.core.inbox.InboxApi
 import dev.hermeskotlin.core.inbox.InboxNotices
 import dev.hermeskotlin.core.push.PushKeys
 import dev.hermeskotlin.core.push.PushSetup
+import dev.hermeskotlin.core.auth.SignInKeepAlive
 import dev.hermeskotlin.core.voice.ReadAloudKeepAlive
 import dev.hermeskotlin.core.voice.VoiceKeepAlive
 import dev.hermeskotlin.core.wear.WatchRelay
@@ -46,6 +47,7 @@ val notifyModule = module {
     single { VoiceCallKeeper(androidContext()) } bind VoiceKeepAlive::class
     single { ReadAloudKeeper(androidContext()) } bind ReadAloudKeepAlive::class
     single { ChatServiceKeeper(androidContext()) }
+    single { SignInKeeper(androidContext(), get()) } bind SignInKeepAlive::class
     single { ChatNotifier(get(), get(), get(), get(), get(), get(), get(), get<WatchRelay>().busy) }
     single { WatchNotifier(get(), get(), get(), get(), get(), get(), get(), get()) }
     single { BotNotifier(androidContext(), get(), get(), get(), get(), get(), get(), get(), get()) }
@@ -57,6 +59,6 @@ val notifyModule = module {
     single { PhoneConfirmations(androidContext()) }
     single { Geofences(androidContext(), get(), get()) } bind WatchedPlaces::class
     single { ChatTargets(get(), get(), get(), get()) }
-    single { AndroidPhoneTools(androidContext(), get(), get(), get(), get(), get()) } bind PhoneToolRunner::class
+    single { AndroidPhoneTools(androidContext(), get(), get(), get(), get(), get(), get(), get()) } bind PhoneToolRunner::class
     single { PhoneToolsBridge(get(), get(), get(), get(), get(), get(), get(), get(), deviceName = { Build.MODEL ?: "Android phone" }) }
 }

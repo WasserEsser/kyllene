@@ -4,6 +4,7 @@ import dev.hermeskotlin.core.auth.secureRandomBytes
 import dev.hermeskotlin.core.connection.ConnectionState
 import dev.hermeskotlin.core.connection.GatewayConnection
 import dev.hermeskotlin.core.gateway.GatewayRepository
+import dev.hermeskotlin.core.gateway.GatewayUrl
 import dev.hermeskotlin.core.network.HermesJson
 import dev.hermeskotlin.core.phone.PhoneToolsStatus.State
 import dev.hermeskotlin.core.push.KnownPhone
@@ -13,6 +14,7 @@ import dev.hermeskotlin.core.push.PushApi
 import dev.hermeskotlin.core.push.PushKeys
 import dev.hermeskotlin.core.push.PushMessage
 import dev.hermeskotlin.core.rpc.JsonRpcClient
+import dev.hermeskotlin.core.settings.AppSettings
 import dev.hermeskotlin.core.settings.SettingsStore
 import dev.hermeskotlin.core.storage.KeyValueStore
 import io.ktor.util.date.getTimeMillis
@@ -20,8 +22,10 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -65,6 +69,7 @@ class PhoneToolsBridge(
     private val scope: CoroutineScope,
     private val deviceName: () -> String,
     private val now: () -> Long = ::getTimeMillis,
+    private val desktopScreensOnly: Boolean = false,
 ) {
     private val _status = MutableStateFlow(PhoneToolsStatus())
     val status: StateFlow<PhoneToolsStatus> = _status.asStateFlow()
@@ -95,20 +100,33 @@ class PhoneToolsBridge(
     @Serializable
     private data class Identity(val id: String, val key: String)
 
-    private class Running(val tool: String, val job: Job)
+    private class Running(val tool: String, val job: Job, val origin: JsonRpcClient?)
 
-    private val running = mutableMapOf<String, Running>()
+    private data class RequestKey(val id: String, val gateway: GatewayUrl?)
 
-    /** Calls already answered, so a fetch made before the answer landed doesn't run them twice. */
-    private val answered = ArrayDeque<String>()
+    private data class RequestOrigin(val connection: ConnectionState.Connected, val identity: Identity)
+
+    private val running = mutableMapOf<RequestKey, Running>()
+
+    /** A socket-bound call has its response and is still delivering it. A pending fetch must not start the tool again. */
+    private val boundAnswering = mutableSetOf<RequestKey>()
+
+    /** Calls we are done handling, so an earlier pending snapshot cannot run them twice. */
+    private val completed = ArrayDeque<RequestKey>()
     private val runningLock = Mutex()
     private val draining = Mutex()
     private val identityLock = Mutex()
+    private val drainBursts = MutableSharedFlow<LongArray>(extraBufferCapacity = 1, onBufferOverflow = BufferOverflow.DROP_OLDEST)
+
+    private fun enabled(settings: AppSettings?): Set<PhoneTool> {
+        val tools = settings?.enabledPhoneTools().orEmpty()
+        return if (desktopScreensOnly) tools.intersect(setOf(PhoneTool.ShowUi)) else tools
+    }
 
     fun start() {
         scope.launch {
             val client = connection.state.map { (it as? ConnectionState.Connected)?.client }.distinctUntilChanged()
-            val enabled = settings.settings.filterNotNull().map { it.enabledPhoneTools() }.distinctUntilChanged()
+            val enabled = settings.settings.filterNotNull().map(::enabled).distinctUntilChanged()
             // A plugin update from Notifications anywhere: look again, so the page doesn't still offer it. Turned on
             // (or off) after the tools were reported: report again, so a call rings through the push off the network.
             combine(client, enabled, setUps, api.updates, api.registrations) { c, on, setUp, _, _ -> Triple(c, on, setUp) }.collectLatest { (c, on, setUp) ->
@@ -127,7 +145,7 @@ class PhoneToolsBridge(
     /** A push said a call waits: fetch it now. */
     fun wake() {
         scope.launch {
-            if (connection.state.value is ConnectionState.Connected && settings.settings.value?.enabledPhoneTools().orEmpty().isNotEmpty()) {
+            if (connection.state.value is ConnectionState.Connected && enabled(settings.settings.value).isNotEmpty()) {
                 drain()
             }
         }
@@ -148,23 +166,39 @@ class PhoneToolsBridge(
             return
         }
         coroutineScope {
-            // From the start: the turn sent while the report is on its way is the one about to call a tool.
-            val teller = launch { tellWhereTurnsComeFrom(client) }
+            // The plugin binds every phone tool to the turn's device when it hears "here". Desktop advertises
+            // only screens, so use the gateway's normal device order for its turns.
+            // On Android, start before the report so a turn sent while it is on its way is still told.
+            val teller = if (desktopScreensOnly) null else launch { tellWhereTurnsComeFrom(client) }
             if (!reportUntilDone(on, setUp)) {
-                teller.cancel()
+                teller?.cancel()
                 return@coroutineScope
             }
             launch { phonesCall { api.phoneList(it.id, it.key) } }
             launch {
+                drainBursts.collectLatest { waits ->
+                    for (wait in waits) {
+                        delay(wait)
+                        drain()
+                    }
+                }
+            }
+            launch {
                 client.events
-                    .filter { it.type == "tool.start" && toolName(it.payload)?.startsWith(TOOL_PREFIX) == true }
-                    .collect {
-                        // The event can come before the gateway has written the call down: look again shortly.
-                        launch {
-                            for (wait in EVENT_DRAINS_MS) {
-                                delay(wait)
-                                drain()
+                    .filter { it.type == "tool.start" }
+                    .collect { event ->
+                        val name = toolName(event.payload)
+                        if (name?.startsWith(TOOL_PREFIX) == true) {
+                            // The event can come before the gateway has written the call down: look again shortly.
+                            launch {
+                                for (wait in EVENT_DRAINS_MS) {
+                                    delay(wait)
+                                    drain()
+                                }
                             }
+                        } else if (PhoneTool.ShowUi in on) {
+                            // A plugin tool may open a standalone phone_show_ui screen from inside without a phone_* tool.start.
+                            drainBursts.tryEmit(PLUGIN_SCREEN_DRAINS_MS)
                         }
                     }
             }
@@ -312,6 +346,7 @@ class PhoneToolsBridge(
 
     /** The push registration a call can nudge: this phone's, when it's registered with this gateway. */
     private suspend fun pushId(): String? {
+        if (desktopScreensOnly) return null
         if (settings.settings.value?.pushAnywhere != true) return null
         val url = gateways.current()?.gatewayUrl?.value ?: return null
         return keys.deviceId.takeIf { keys.pinnedGatewayUrl() == url }
@@ -319,16 +354,20 @@ class PhoneToolsBridge(
 
     /** Fetches the calls waiting for this phone and starts each one not already running or answered. */
     private suspend fun drain() = draining.withLock {
+        val socket = connection.state.value as? ConnectionState.Connected ?: return@withLock
         val me = identity()
-        val waiting = try {
-            api.phonePending(me.id, me.key)
+        val waiting = pending(me, socket.client) ?: return@withLock
+        if (connection.state.value === socket) startAll(waiting, RequestOrigin(socket, me))
+    }
+
+    private suspend fun pending(me: Identity, client: JsonRpcClient?): List<PhoneRequest>? =
+        try {
+            api.phonePending(me.id, me.key, client)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             null
-        } ?: return@withLock
-        startAll(waiting)
-    }
+        }
 
     /**
      * A push carried a call that rings ([PhoneTool.CallMe]): it rings at once, even while the gateway is out of reach,
@@ -351,16 +390,26 @@ class PhoneToolsBridge(
         scope.launch { startAll(listOf(request)) }
     }
 
-    /** Starts each of [waiting] not already running or answered. */
-    private suspend fun startAll(waiting: List<PhoneRequest>) = runningLock.withLock {
+    /** Starts each of [waiting] not already running or being answered. */
+    private suspend fun startAll(waiting: List<PhoneRequest>, fetchedOn: RequestOrigin? = null) = runningLock.withLock {
         for (request in waiting) {
-            if (request.id in running || request.id in answered) continue
-            running[request.id] = Running(request.tool, scope.launch { handle(request) })
+            val bound = fetchedOn.takeIf { desktopScreensOnly || request.tool == PhoneTool.ShowUi.id }
+            val socket = bound?.connection
+            val key = RequestKey(request.id, socket?.gateway)
+            if (key in running || key in boundAnswering || key in completed) continue
+            val job = scope.launch { handle(request, key, bound) }
+            running[key] = Running(request.tool, job, socket?.client)
         }
     }
 
-    private suspend fun handle(request: PhoneRequest) {
+    private suspend fun handle(request: PhoneRequest, key: RequestKey, bound: RequestOrigin?) {
+        val origin = bound?.connection?.client
         val started = now()
+        if (bound != null && connection.state.value !== bound.connection) {
+            // There is no response to send yet. A fresh fetch on the new socket can start the tool.
+            runningLock.withLock { running.remove(key) }
+            return
+        }
         val tool = PhoneTool.byId(request.tool)
         // Up to the gateway's own deadline, less a margin: the phone may look late (a poll, Doze), and an Allow
         // the agent would never hear of must not change the phone. Measured on the gateway's clock, so a phone
@@ -373,14 +422,14 @@ class PhoneToolsBridge(
         }
         val (result, error) = if (tool == null) {
             null to UNKNOWN_TOOL
-        } else if (tool !in settings.settings.value?.enabledPhoneTools().orEmpty()) {
+        } else if (tool !in enabled(settings.settings.value)) {
             null to SWITCHED_OFF
         } else if (limit <= 0) {
             // Too late to ask or do anything the agent would still hear of: nothing runs.
             null to TOO_LONG
         } else {
             try {
-                withTimeout(limit) { runner.run(tool, request.args, request.session) } to null
+                withTimeout(limit) { runner.run(tool, request.args, request.session, origin) } to null
             } catch (e: TimeoutCancellationException) {
                 null to TOO_LONG
             } catch (e: CancellationException) {
@@ -394,37 +443,91 @@ class PhoneToolsBridge(
         }
         if (tool != null && error != SWITCHED_OFF) _recent.update { (listOf(PhoneToolUse(tool, now(), error)) + it).take(MAX_RECENT) }
         // Out of the running list before answering: switching the tool off now can't send a second answer.
-        if (!finish(request.id)) return
+        if (!finish(key)) return
+        if (bound != null) {
+            val deadline = started + limit + DEADLINE_MARGIN_MS
+            deliverBoundAnswer(request, bound, result, error, deadline)
+            runningLock.withLock {
+                boundAnswering.remove(key)
+                markCompleted(key)
+            }
+            // A plugin tool handling a tap in code often immediately posts an updated screen on the same surface.
+            if (tool == PhoneTool.ShowUi && error == null) drainBursts.tryEmit(POST_ANSWER_DRAINS_MS)
+            return
+        }
         // Until the gateway stops waiting: a call declined off the network gets there once the way back is up.
         answer(request.id, result, error, wait = (started + limit + DEADLINE_MARGIN_MS - now()).coerceAtLeast(ANSWER_WAIT_MS))
     }
 
-    /** Takes [requestId] out of the running list; false when switching off already did (and answered it). */
-    private suspend fun finish(requestId: String): Boolean = runningLock.withLock {
-        val mine = running.remove(requestId) != null
-        if (mine) markAnswered(requestId)
-        mine
+    /** Moves [key] out of the running list; false when switching off already did (and answered it). */
+    private suspend fun finish(key: RequestKey): Boolean = runningLock.withLock {
+        if (running.remove(key) == null) return@withLock false
+        if (key.gateway == null) markCompleted(key) else boundAnswering.add(key)
+        true
     }
 
-    private fun markAnswered(requestId: String) {
-        answered.addLast(requestId)
-        while (answered.size > MAX_ANSWERED) answered.removeFirst()
+    private fun markCompleted(key: RequestKey) {
+        completed.addLast(key)
+        while (completed.size > MAX_COMPLETED) completed.removeFirst()
     }
 
     /** Stops what runs for a tool that's off now (a question on screen, say) and refuses it. */
     private suspend fun refuseSwitchedOff(on: Set<PhoneTool>) {
         val ids = on.map { it.id }.toSet()
         val stopped = runningLock.withLock {
-            running.filterValues { it.tool !in ids }.keys.toList().onEach { id ->
-                running.remove(id)?.job?.cancel()
-                markAnswered(id)
+            running.filterValues { it.tool !in ids }.toList().onEach { (key, _) ->
+                running.remove(key)?.job?.cancel()
+                markCompleted(key)
             }
         }
-        for (id in stopped) scope.launch { answer(id, null, SWITCHED_OFF) }
+        for ((key, call) in stopped) scope.launch { answer(key.id, null, SWITCHED_OFF, origin = call.origin) }
     }
 
-    private suspend fun answer(requestId: String, result: JsonElement?, error: String?, wait: Long = ANSWER_WAIT_MS) {
+    /** Sends the submitted response once, then retries while the same gateway still lists it for this device. */
+    private suspend fun deliverBoundAnswer(
+        request: PhoneRequest,
+        bound: RequestOrigin,
+        result: JsonElement?,
+        error: String?,
+        deadline: Long,
+    ) {
+        val (origin, me) = bound
+        suspend fun send(client: JsonRpcClient): Boolean = try {
+            api.phoneAnswer(me.id, me.key, request.id, result, error, client)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            false
+        }
+        if (send(origin.client)) return
+
+        // Use the device credentials that fetched the call and compare the original request, excluding the
+        // changing gateway clock. A reconnect can open a connection to an entirely different gateway.
+        val expected = request.copy(gatewayNow = 0)
+        withTimeoutOrNull(deadline - now()) {
+            var last = origin
+            while (true) {
+                withTimeoutOrNull(ANSWER_RETRY_MS) { connection.state.first { it !== last } }
+                val connected = connection.state.first {
+                    it is ConnectionState.Connected && it.gateway == origin.gateway
+                } as ConnectionState.Connected
+                last = connected
+                val waiting = pending(me, connected.client) ?: continue
+                if (connection.state.value !== connected) continue
+                if (waiting.none { it.copy(gatewayNow = 0) == expected } || send(connected.client)) break
+            }
+        }
+    }
+
+    private suspend fun answer(
+        requestId: String,
+        result: JsonElement?,
+        error: String?,
+        wait: Long = ANSWER_WAIT_MS,
+        origin: JsonRpcClient? = null,
+    ) {
         try {
+            if (origin != null && (connection.state.value as? ConnectionState.Connected)?.client !== origin) return
             // A call rung from a push may end while Kyllene can't reach the gateway: the answer waits for it, trying
             // again every few seconds rather than sitting out a long backoff once the network is back.
             if (connection.state.value !is ConnectionState.Connected) {
@@ -436,7 +539,7 @@ class PhoneToolsBridge(
                 } ?: return
             }
             val me = identity()
-            api.phoneAnswer(me.id, me.key, requestId, result, error)
+            api.phoneAnswer(me.id, me.key, requestId, result, error, origin)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -480,6 +583,12 @@ class PhoneToolsBridge(
         /** After a chat's `phone_*` tool starts: when to look for its call. */
         val EVENT_DRAINS_MS = longArrayOf(300, 700, 1_500, 3_000)
 
+        /** After a non-phone plugin tool starts while screens are enabled: look shortly for an inner screen. */
+        val PLUGIN_SCREEN_DRAINS_MS = longArrayOf(300, 900, 2_000, 4_000)
+
+        /** After answering a screen: look quickly for a plugin's follow-up update on the same surface. */
+        val POST_ANSWER_DRAINS_MS = longArrayOf(150, 450, 1_000, 2_000)
+
         /** Between tries of a report that failed. */
         val RETRY_MS = longArrayOf(2_000, 5_000, 15_000, 30_000, 60_000)
 
@@ -506,7 +615,7 @@ class PhoneToolsBridge(
         const val SWITCHED_OFF = "The user turned this tool off on the phone."
         const val UNKNOWN_TOOL = "This version of Kyllene doesn't have that tool; the user can update Kyllene."
         private val WAITS_FOR_USER = setOf(State.NotInstalled, State.Outdated)
-        private const val MAX_ANSWERED = 200
+        private const val MAX_COMPLETED = 200
         private const val ID_BYTES = 16
         private const val KEY_BYTES = 32
         private const val KEY_IDENTITY = "phone.identity"
